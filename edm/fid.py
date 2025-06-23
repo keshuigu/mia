@@ -22,7 +22,7 @@ from training import dataset
 
 def calculate_inception_stats(
     image_path, num_expected=None, seed=0, max_batch_size=64,
-    num_workers=3, prefetch_factor=2, device=torch.device('cuda'),
+    num_workers=0, prefetch_factor=2, device=torch.device('cuda'),
 ):
     # Rank 0 goes first.
     if dist.get_rank() != 0:

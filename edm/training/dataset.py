@@ -6,7 +6,8 @@
 # work. If not, see http://creativecommons.org/licenses/by-nc-sa/4.0/
 
 """Streaming images and labels from datasets created with dataset_tool.py."""
-
+import sys
+sys.path.append("/home/yu/workspace/mia/edm")
 import os
 import numpy as np
 import zipfile
@@ -248,3 +249,97 @@ class ImageFolderDataset(Dataset):
         return labels
 
 #----------------------------------------------------------------------------
+
+
+class CelebAFeatureDataset(Dataset):
+    def __init__(self, path, feature_npz, resolution=112, max_size=None, use_labels=True, xflip=False, random_seed=0, cache=False):
+        self.img_dir = path
+        self._resolution = resolution  # 用私有变量存储
+        self._use_labels = use_labels
+        self._cache = cache
+        self._cached_images = dict()
+        self._raw_labels = None
+        self._label_shape = None
+        # 加载图片名和特征
+        data = np.load(feature_npz, allow_pickle=True)
+        self.img_names = [str(x) for x in data['img_names']]
+        self.features = data['features']
+        raw_shape = [len(self.img_names), 3, resolution, resolution]
+        super().__init__(name='celeba_feature', raw_shape=raw_shape, max_size=max_size, use_labels=use_labels, xflip=xflip, random_seed=random_seed, cache=cache)
+
+    def _load_raw_image(self, raw_idx):
+        img_path = os.path.join(self.img_dir, self.img_names[raw_idx])
+        image = PIL.Image.open(img_path).convert('RGB').resize((self._resolution, self._resolution))
+        image = np.array(image)
+        if image.ndim == 2:
+            image = image[:, :, np.newaxis]
+        image = image.transpose(2, 0, 1)  # HWC -> CHW
+        return image.astype(np.uint8)
+
+    def _load_raw_labels(self):
+        # 返回特征作为label
+        return self.features.astype(np.float32)
+
+    @property
+    def resolution(self):
+        return self._resolution
+
+if __name__ == "__main__":
+    import os
+    import torch
+    from torchvision import transforms
+    from PIL import Image
+    import numpy as np
+    import random
+    import cv2
+    import skimage.transform as sk_transform
+    # Example usage
+    dataset = CelebAFeatureDataset(
+        path="/home/yu/celeba/img_align_celeba_112",
+        feature_npz="/home/yu/celeba/celeba_arcface_features_align.npz",
+        resolution=112,
+        use_labels=True,
+    )
+    print(f"Dataset name: {dataset.name}")
+    print(f"Image shape: {dataset.image_shape}")
+    print(f"Label shape: {dataset.label_shape}")
+    print(f"Number of images: {len(dataset)}")
+    import sys
+    sys.path.append('/home/yu/workspace/mia/arcface')
+    from backbones import get_model
+    state_dict = torch.load('/home/yu/workspace/mia/ckpts/arcface_r100.pth', map_location='cpu')
+    model = get_model('r100')
+    if any(k.startswith('module.') for k in state_dict.keys()):
+        from collections import OrderedDict
+        new_state_dict = OrderedDict()
+        for k, v in state_dict.items():
+            name = k.replace('module.', '')
+            new_state_dict[name] = v
+        state_dict = new_state_dict
+    model.load_state_dict(state_dict)
+    model = model.cuda() if torch.cuda.is_available() else model
+    model.eval()
+    f1,f2 = None, None
+    for i in 0,403:
+        img, label = dataset[i]
+        img = np.transpose(img, (1, 2, 0))  # CHW -> HWC
+        img = transforms.ToTensor()(img)
+        img.unsqueeze_(0)
+        img = transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5])(img)
+        feats = model(img.cuda()).detach().cpu()
+        feats = feats.squeeze(0)  # Remove batch dimension
+        label = torch.tensor(label, dtype=torch.float32).cuda()  # Ensure label is a tensor
+        feats = torch.nn.functional.normalize(feats, dim=0).cuda()
+        if i == 0:
+            f1 = feats
+        else:
+            f2 = feats
+        data_feats = torch.nn.functional.normalize(label, dim=0).cuda()
+        print((feats*data_feats).sum().item())
+        # 计算MSE
+        mse = torch.mean((feats - data_feats) ** 2).item()
+        print(f"ArcFace特征MSE: {mse:.6f}")
+        # 计算MSE
+    mse = torch.mean((f1 - f2) ** 2).item()
+    print(f"ArcFace特征MSE: {mse:.6f}")
+    print((f1*f2).sum().item())

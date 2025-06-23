@@ -31,6 +31,11 @@ def generate_image_grid(
     with dnnlib.util.open_url(network_pkl) as f:
         net = pickle.load(f)['ema'].to(device)
 
+    if device.type == 'cuda':
+        total = torch.cuda.get_device_properties(device).total_memory / (1024 ** 2)
+        used = torch.cuda.memory_allocated(device) / (1024 ** 2)
+        print(f'显存使用: {used:.2f}MB / {total:.2f}MB ({used/total*100:.1f}%)')
+
     # Pick latents and labels.
     print(f'Generating {batch_size} images...')
     latents = torch.randn([batch_size, net.img_channels, net.img_resolution, net.img_resolution], device=device)
@@ -49,24 +54,25 @@ def generate_image_grid(
 
     # Main sampling loop.
     x_next = latents.to(torch.float64) * t_steps[0]
-    for i, (t_cur, t_next) in tqdm.tqdm(list(enumerate(zip(t_steps[:-1], t_steps[1:]))), unit='step'): # 0, ..., N-1
-        x_cur = x_next
+    with torch.no_grad():
+        for i, (t_cur, t_next) in tqdm.tqdm(list(enumerate(zip(t_steps[:-1], t_steps[1:]))), unit='step'): # 0, ..., N-1
+            x_cur = x_next
 
-        # Increase noise temporarily.
-        gamma = min(S_churn / num_steps, np.sqrt(2) - 1) if S_min <= t_cur <= S_max else 0
-        t_hat = net.round_sigma(t_cur + gamma * t_cur)
-        x_hat = x_cur + (t_hat ** 2 - t_cur ** 2).sqrt() * S_noise * torch.randn_like(x_cur)
+            # Increase noise temporarily.
+            gamma = min(S_churn / num_steps, np.sqrt(2) - 1) if S_min <= t_cur <= S_max else 0
+            t_hat = net.round_sigma(t_cur + gamma * t_cur)
+            x_hat = x_cur + (t_hat ** 2 - t_cur ** 2).sqrt() * S_noise * torch.randn_like(x_cur)
 
-        # Euler step.
-        denoised = net(x_hat, t_hat, class_labels).to(torch.float64)
-        d_cur = (x_hat - denoised) / t_hat
-        x_next = x_hat + (t_next - t_hat) * d_cur
+            # Euler step.
+            denoised = net(x_hat, t_hat, class_labels).to(torch.float64)
+            d_cur = (x_hat - denoised) / t_hat
+            x_next = x_hat + (t_next - t_hat) * d_cur
 
-        # Apply 2nd order correction.
-        if i < num_steps - 1:
-            denoised = net(x_next, t_next, class_labels).to(torch.float64)
-            d_prime = (x_next - denoised) / t_next
-            x_next = x_hat + (t_next - t_hat) * (0.5 * d_cur + 0.5 * d_prime)
+            # Apply 2nd order correction.
+            if i < num_steps - 1:
+                denoised = net(x_next, t_next, class_labels).to(torch.float64)
+                d_prime = (x_next - denoised) / t_next
+                x_next = x_hat + (t_next - t_hat) * (0.5 * d_cur + 0.5 * d_prime)
 
     # Save image grid.
     print(f'Saving image grid to "{dest_path}"...')
@@ -77,6 +83,81 @@ def generate_image_grid(
     PIL.Image.fromarray(image, 'RGB').save(dest_path)
     print('Done.')
 
+
+def generate_image_grid_one_by_one(
+    network_pkl, dest_path,
+    seed=0, gridw=8, gridh=8, device=torch.device('cuda'),
+    num_steps=18, sigma_min=0.002, sigma_max=80, rho=7,
+    S_churn=0, S_min=0, S_max=float('inf'), S_noise=1,
+):
+    batch_size = gridw * gridh
+    torch.manual_seed(seed)
+
+    # Load network.
+    print(f'Loading network from "{network_pkl}"...')
+    with dnnlib.util.open_url(network_pkl) as f:
+        net = pickle.load(f)['ema'].to(device)
+
+    # Pick labels.
+    class_labels = None
+    if net.label_dim:
+        all_labels = torch.randint(net.label_dim, size=[batch_size], device=device)
+        all_onehot = torch.eye(net.label_dim, device=device)[all_labels]
+    else:
+        all_onehot = [None] * batch_size
+
+    # Adjust noise levels based on what's supported by the network.
+    sigma_min = max(sigma_min, net.sigma_min)
+    sigma_max = min(sigma_max, net.sigma_max)
+
+    # Time step discretization (float32).
+    step_indices = torch.arange(num_steps, dtype=torch.float32, device=device)
+    t_steps = (sigma_max ** (1 / rho) + step_indices / (num_steps - 1) * (sigma_min ** (1 / rho) - sigma_max ** (1 / rho))) ** rho
+    t_steps = torch.cat([net.round_sigma(t_steps), torch.zeros_like(t_steps[:1])]) # t_N = 0
+
+    # 逐张采样，减少显存
+    images = []
+    for i in tqdm.tqdm(range(batch_size), desc='Sampling'):
+        latents = torch.randn([1, net.img_channels, net.img_resolution, net.img_resolution], device=device)
+        if net.label_dim:
+            class_labels = all_onehot[i].unsqueeze(0)
+        else:
+            class_labels = None
+
+        x_next = latents.to(torch.float32) * t_steps[0]
+        with torch.no_grad():
+            for j, (t_cur, t_next) in enumerate(zip(t_steps[:-1], t_steps[1:])):
+                x_cur = x_next
+
+                # Increase noise temporarily.
+                gamma = min(S_churn / num_steps, np.sqrt(2) - 1) if S_min <= t_cur <= S_max else 0
+                t_hat = net.round_sigma(t_cur + gamma * t_cur)
+                x_hat = x_cur + (t_hat ** 2 - t_cur ** 2).sqrt() * S_noise * torch.randn_like(x_cur)
+
+                # Euler step.
+                denoised = net(x_hat, t_hat, class_labels).to(torch.float32)
+                d_cur = (x_hat - denoised) / t_hat
+                x_next = x_hat + (t_next - t_hat) * d_cur
+
+                # Apply 2nd order correction.
+                if j < num_steps - 1:
+                    denoised = net(x_next, t_next, class_labels).to(torch.float32)
+                    d_prime = (x_next - denoised) / t_next
+                    x_next = x_hat + (t_next - t_hat) * (0.5 * d_cur + 0.5 * d_prime)
+                del x_cur, x_hat, denoised, d_cur  # 及时释放
+
+        image = (x_next * 127.5 + 128).clip(0, 255).to(torch.uint8)
+        images.append(image[0].cpu())
+        del x_next, latents, class_labels
+
+    # 拼接图片网格
+    images = torch.stack(images, dim=0)
+    images = images.reshape(gridh, gridw, net.img_channels, net.img_resolution, net.img_resolution)
+    images = images.permute(0, 3, 1, 4, 2).reshape(gridh * net.img_resolution, gridw * net.img_resolution, net.img_channels)
+    images = images.numpy()
+    PIL.Image.fromarray(images, 'RGB').save(dest_path)
+    print('Done.')
+
 #----------------------------------------------------------------------------
 
 def main():
@@ -84,7 +165,7 @@ def main():
     generate_image_grid(f'{model_root}/edm-cifar10-32x32-cond-vp.pkl',   'cifar10-32x32.png',  num_steps=18) # FID = 1.79, NFE = 35
     generate_image_grid(f'{model_root}/edm-ffhq-64x64-uncond-vp.pkl',    'ffhq-64x64.png',     num_steps=40) # FID = 2.39, NFE = 79
     generate_image_grid(f'{model_root}/edm-afhqv2-64x64-uncond-vp.pkl',  'afhqv2-64x64.png',   num_steps=40) # FID = 1.96, NFE = 79
-    generate_image_grid(f'{model_root}/edm-imagenet-64x64-cond-adm.pkl', 'imagenet-64x64.png', num_steps=256, S_churn=40, S_min=0.05, S_max=50, S_noise=1.003) # FID = 1.36, NFE = 511
+    generate_image_grid_one_by_one(f'{model_root}/edm-imagenet-64x64-cond-adm.pkl', 'imagenet-64x64.png', num_steps=256, S_churn=40, S_min=0.05, S_max=50, S_noise=1.003) # FID = 1.36, NFE = 511
 
 #----------------------------------------------------------------------------
 
